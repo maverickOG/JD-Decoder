@@ -102,7 +102,7 @@ async def call_gemini_with_retry(api_key: str, prompt: str, max_retries: int = 3
         }],
         "generationConfig": {
             "temperature": 0.3,
-            "maxOutputTokens": 2048
+            "maxOutputTokens": 4096
         }
     }
     
@@ -163,20 +163,89 @@ async def call_gemini_with_retry(api_key: str, prompt: str, max_retries: int = 3
 
 
 def parse_gemini_response(response_text: str) -> dict:
-    """Parse JSON from Gemini response text"""
+    """Parse JSON from Gemini response text with multiple fallback strategies"""
+    logger.info(f"Raw response text length: {len(response_text)} chars")
+    logger.info(f"Raw response: {response_text}")
+    
     cleaned = response_text.strip()
-    cleaned = re.sub(r'^```json\s*', '', cleaned)
-    cleaned = re.sub(r'^```\s*', '', cleaned)
-    cleaned = re.sub(r'\s*```$', '', cleaned)
+    
+    # Remove markdown code block markers
+    cleaned = re.sub(r'^```(?:json)?\s*\n?', '', cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r'\n?```\s*$', '', cleaned, flags=re.MULTILINE)
     cleaned = cleaned.strip()
     
+    # Strategy 1: Direct JSON parse
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        json_match = re.search(r'\{[\s\S]*\}', cleaned)
-        if json_match:
-            return json.loads(json_match.group())
-        raise ValueError(f"Could not parse JSON from response: {response_text[:200]}")
+        logger.info("Strategy 1: Attempting direct JSON parse...")
+        result = json.loads(cleaned)
+        logger.info("✓ Direct JSON parse succeeded")
+        return result
+    except json.JSONDecodeError as e:
+        logger.warning(f"Strategy 1 failed at position {e.pos}: {e.msg}")
+    
+    # Strategy 2: Try to complete incomplete JSON (missing closing brackets)
+    logger.info("Strategy 2: Attempting to auto-complete incomplete JSON...")
+    incomplete = cleaned
+    # Count opening and closing braces
+    open_braces = incomplete.count('{')
+    close_braces = incomplete.count('}')
+    if open_braces > close_braces:
+        logger.info(f"Detected incomplete JSON: {open_braces} open, {close_braces} close braces")
+        incomplete += '}' * (open_braces - close_braces)
+        try:
+            result = json.loads(incomplete)
+            logger.info("✓ Auto-completed JSON parse succeeded")
+            return result
+        except json.JSONDecodeError as e:
+            logger.warning(f"Strategy 2 failed: {e}")
+    
+    # Strategy 3: Extract JSON by braces
+    logger.info("Strategy 3: Attempting brace-matching extraction...")
+    start_idx = cleaned.find('{')
+    if start_idx != -1:
+        brace_count = 0
+        for i in range(start_idx, len(cleaned)):
+            if cleaned[i] == '{':
+                brace_count += 1
+            elif cleaned[i] == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    json_candidate = cleaned[start_idx:i+1]
+                    try:
+                        result = json.loads(json_candidate)
+                        logger.info("✓ Brace-matching extraction succeeded")
+                        return result
+                    except json.JSONDecodeError as e:
+                        logger.warning(f"Strategy 3 failed at position {e.pos}: {e.msg}")
+                        break
+    
+    # Strategy 4: Try to fix common JSON issues (unescaped newlines in strings)
+    logger.info("Strategy 4: Attempting to repair JSON...")
+    try:
+        # Replace literal newlines inside strings with \n
+        fixed = cleaned.replace('\n', '\\n')
+        result = json.loads(fixed)
+        logger.info("✓ Repaired JSON parse succeeded")
+        return result
+    except json.JSONDecodeError as e:
+        logger.warning(f"Strategy 4 failed: {e}")
+    
+    # Strategy 5: Extract the JSON and try to parse it multiple times
+    logger.info("Strategy 5: Attempting lenient extraction and re-parse...")
+    json_match = re.search(r'\{[\s\S]*\}', cleaned)
+    if json_match:
+        candidate = json_match.group()
+        try:
+            result = json.loads(candidate)
+            logger.info("✓ Lenient extraction succeeded")
+            return result
+        except json.JSONDecodeError:
+            pass
+    
+    # If all strategies fail, log everything and raise
+    logger.error(f"All parsing strategies failed")
+    logger.error(f"Full response (length {len(cleaned)}): {cleaned}")
+    raise ValueError(f"Could not parse JSON from Gemini response after 5 strategies. Response was incomplete or malformed.")
 
 
 @api_router.post("/decode", response_model=DecodeResponse)
@@ -220,13 +289,31 @@ async def decode_job_description(request: DecodeRequest):
     
     try:
         # Build prompt
-        prompt = f"""Analyze the following job description and extract key information.
+        prompt = f"""Analyze the following job description and extract key information. Be BRUTALLY HONEST and RAW in your analysis.
+
+IMPORTANT DISTINCTIONS:
+- SKILLS = abilities, technical proficiencies, or soft skills (React, Python, communication, problem-solving)
+- REQUIREMENTS = location, availability, on-site/remote status (these are NOT skills)
+- QUALIFICATIONS = degrees, certifications, years of experience in a domain
+- Don't include location requirements as skills.
 
 Return ONLY a valid JSON object with these exact fields:
-- mustHave: array of critical required skills and qualifications (be specific)
-- niceToHave: array of preferred/optional skills
-- keywords: array of important ATS-friendly keywords for resume optimization
-- insights: array of observations including red flags, company culture hints, unrealistic expectations, or notable benefits
+- mustHave: array of CRITICAL SKILLS AND QUALIFICATIONS ONLY (technical skills, soft skills, degrees, relevant experience domains). Exclude pure location/availability constraints. Be specific and actionable.
+- niceToHave: array of PREFERRED SKILLS AND QUALIFICATIONS (secondary but valuable). Focus on skills and experiences, not constraints.
+- keywords: array of important ATS-friendly keywords for resume optimization (job titles, technologies, methodologies, industry terms)
+- insights: array of BRUTALLY HONEST observations. Be RAW and DIRECT. Include:
+  * Red flags (unrealistic demands, vague expectations, exploitation risks, unsustainable work hours)
+  * What the company ACTUALLY wants (read between the lines - what are they really asking for?)
+  * Hidden expectations or implied requirements not explicitly stated
+  * Work culture hints (toxic indicators, pressure, intensity level)
+  * Realistic assessment of compensation vs demands
+  * Location/travel requirements and their implications
+  * Hiring process weirdness or unconventional approaches (good or bad?)
+  * Real talk: Who should apply vs who should run away
+  * Notable benefits if they exist, or lack thereof
+  * Inconsistencies or contradictions in the JD
+
+TONE: Be direct, honest, and slightly cynical if needed. Don't sugarcoat. Tell the truth about what working here would actually be like.
 
 Be concise, practical, and actionable. No markdown formatting. No explanations outside the JSON.
 
